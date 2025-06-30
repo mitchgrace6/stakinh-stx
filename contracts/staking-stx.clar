@@ -39,7 +39,85 @@
 (define-constant early-withdrawal-penalty u1000) ;; 10% penalty for early withdrawal
 
 ;; data maps and vars
-;;
+
+;; Map to track individual user stakes
+(define-map user-stakes
+  { user: principal }
+  {
+    amount: uint,           ;; Amount staked in micro-STX
+    start-block: uint,      ;; Block when staking started
+    end-block: uint,        ;; Block when staking period ends
+    staking-period: uint,   ;; Length of staking period in blocks
+    reward-rate: uint,      ;; Total reward rate (base + bonus) in basis points
+    last-claim-block: uint, ;; Last block when rewards were claimed
+    is-active: bool         ;; Whether the stake is currently active
+  }
+)
+
+;; Map to track user reward balances (unclaimed rewards)
+(define-map user-rewards
+  { user: principal }
+  { 
+    pending-rewards: uint,  ;; Accumulated rewards not yet claimed
+    total-claimed: uint     ;; Total rewards claimed historically
+  }
+)
+
+;; Map to track user staking history and statistics
+(define-map user-stats
+  { user: principal }
+  {
+    total-staked-ever: uint,    ;; Total amount ever staked by user
+    total-rewards-earned: uint, ;; Total rewards earned by user
+    stake-count: uint,          ;; Number of times user has staked
+    first-stake-block: uint     ;; Block of user's first stake
+  }
+)
+
+;; Map to track staking periods and their configurations
+(define-map staking-period-config
+  { period-blocks: uint }
+  {
+    reward-bonus: uint,     ;; Bonus reward rate for this period
+    is-active: bool,        ;; Whether this staking period is available
+    min-amount: uint,       ;; Minimum stake amount for this period
+    max-amount: uint        ;; Maximum stake amount for this period
+  }
+)
+
+;; Global contract state variables
+(define-data-var contract-paused bool false)
+(define-data-var total-staked uint u0)
+(define-data-var total-rewards-distributed uint u0)
+(define-data-var total-users uint u0)
+(define-data-var reward-pool-balance uint u0)
+(define-data-var emergency-shutdown bool false)
+
+;; Admin and governance variables
+(define-data-var contract-admin principal tx-sender)
+(define-data-var pending-admin (optional principal) none)
+(define-data-var fee-recipient principal tx-sender)
+
+;; Reward calculation variables
+(define-data-var base-reward-multiplier uint u10000) ;; 100.00% in basis points
+(define-data-var reward-pool-last-update uint block-height)
+
+;; Protocol fee settings (in basis points)
+(define-data-var protocol-fee-rate uint u100) ;; 1% fee on rewards
+(define-data-var early-withdrawal-fee-rate uint u1000) ;; 10% fee on early withdrawal
+
+;; Staking limits and controls
+(define-data-var max-stake-per-user uint max-stake-amount)
+(define-data-var min-stake-global uint min-stake-amount)
+(define-data-var staking-enabled bool true)
+
+;; Reward distribution tracking
+(define-data-var last-reward-distribution-block uint block-height)
+(define-data-var reward-distribution-interval uint u4320) ;; ~30 days in blocks
+
+;; Emergency and maintenance
+(define-data-var maintenance-mode bool false)
+(define-data-var upgrade-delay uint u17280) ;; ~4 months delay for upgrades
 
 ;; private functions
 ;;

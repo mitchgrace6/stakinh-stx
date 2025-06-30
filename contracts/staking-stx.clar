@@ -120,7 +120,234 @@
 (define-data-var upgrade-delay uint u17280) ;; ~4 months delay for upgrades
 
 ;; private functions
-;;
+
+;; Validation functions
+(define-private (is-contract-admin (user principal))
+  (is-eq user (var-get contract-admin))
+)
+
+(define-private (is-contract-owner (user principal))
+  (is-eq user contract-owner)
+)
+
+(define-private (is-authorized-admin (user principal))
+  (or (is-contract-owner user) (is-contract-admin user))
+)
+
+(define-private (is-contract-operational)
+  (and 
+    (not (var-get contract-paused))
+    (not (var-get emergency-shutdown))
+    (not (var-get maintenance-mode))
+    (var-get staking-enabled)
+  )
+)
+
+(define-private (validate-stake-amount (amount uint))
+  (and 
+    (>= amount (var-get min-stake-global))
+    (<= amount (var-get max-stake-per-user))
+    (> amount u0)
+  )
+)
+
+(define-private (validate-staking-period (period uint))
+  (or 
+    (is-eq period min-staking-period)
+    (is-eq period standard-staking-period)
+    (is-eq period long-staking-period)
+  )
+)
+
+(define-private (can-stake-more (user principal) (new-amount uint))
+  (let (
+    (current-stake (default-to { amount: u0, start-block: u0, end-block: u0, staking-period: u0, reward-rate: u0, last-claim-block: u0, is-active: false } 
+                               (map-get? user-stakes { user: user })))
+    (current-amount (get amount current-stake))
+    (total-after-stake (+ current-amount new-amount))
+  )
+    (and 
+      (<= total-after-stake (var-get max-stake-per-user))
+      (<= (+ (var-get total-staked) new-amount) max-total-staked)
+    )
+  )
+)
+
+;; Reward calculation functions
+(define-private (calculate-reward-rate (staking-period uint))
+  (if (is-eq staking-period long-staking-period) 
+    (+ base-reward-rate bonus-rate-long)
+    (if (is-eq staking-period standard-staking-period)
+      (+ base-reward-rate bonus-rate-standard)
+      base-reward-rate
+    )
+  )
+)
+
+(define-private (calculate-time-based-rewards (amount uint) (reward-rate uint) (blocks-staked uint))
+  (let (
+    (annual-reward (/ (* amount reward-rate) u10000))
+    (block-reward (/ annual-reward blocks-per-year))
+    (total-reward (* block-reward blocks-staked))
+  )
+    total-reward
+  )
+)
+
+(define-private (calculate-pending-rewards (user principal))
+  (match (map-get? user-stakes { user: user })
+    stake-info 
+    (if (get is-active stake-info)
+      (let (
+        (blocks-since-last-claim (- block-height (get last-claim-block stake-info)))
+        (time-based-reward (calculate-time-based-rewards 
+                           (get amount stake-info)
+                           (get reward-rate stake-info)
+                           blocks-since-last-claim))
+        (current-rewards (default-to { pending-rewards: u0, total-claimed: u0 } 
+                                   (map-get? user-rewards { user: user })))
+      )
+        (+ (get pending-rewards current-rewards) time-based-reward)
+      )
+      u0
+    )
+    u0
+  )
+)
+
+(define-private (apply-protocol-fee (reward-amount uint))
+  (let (
+    (fee-amount (/ (* reward-amount (var-get protocol-fee-rate)) u10000))
+    (net-reward (- reward-amount fee-amount))
+  )
+    { fee: fee-amount, net-reward: net-reward }
+  )
+)
+
+(define-private (calculate-early-withdrawal-penalty (amount uint))
+  (/ (* amount (var-get early-withdrawal-fee-rate)) u10000)
+)
+
+;; State update functions
+(define-private (update-user-stake (user principal) (amount uint) (staking-period uint))
+  (let (
+    (reward-rate (calculate-reward-rate staking-period))
+    (end-block (+ block-height staking-period))
+    (current-stats (default-to { total-staked-ever: u0, total-rewards-earned: u0, stake-count: u0, first-stake-block: u0 }
+                               (map-get? user-stats { user: user })))
+    (is-first-stake (is-eq (get stake-count current-stats) u0))
+  )
+    (begin
+      ;; Update user stake
+      (map-set user-stakes { user: user }
+        {
+          amount: amount,
+          start-block: block-height,
+          end-block: end-block,
+          staking-period: staking-period,
+          reward-rate: reward-rate,
+          last-claim-block: block-height,
+          is-active: true
+        }
+      )
+      ;; Update user stats
+      (map-set user-stats { user: user }
+        {
+          total-staked-ever: (+ (get total-staked-ever current-stats) amount),
+          total-rewards-earned: (get total-rewards-earned current-stats),
+          stake-count: (+ (get stake-count current-stats) u1),
+          first-stake-block: (if is-first-stake block-height (get first-stake-block current-stats))
+        }
+      )
+      true
+    )
+  )
+)
+
+(define-private (update-global-stats (amount uint) (is-new-user bool))
+  (begin
+    (var-set total-staked (+ (var-get total-staked) amount))
+    (if is-new-user 
+      (var-set total-users (+ (var-get total-users) u1))
+      true
+    )
+    true
+  )
+)
+
+(define-private (deactivate-user-stake (user principal))
+  (match (map-get? user-stakes { user: user })
+    stake-info
+    (begin
+      (map-set user-stakes { user: user }
+        (merge stake-info { is-active: false })
+      )
+      (var-set total-staked (- (var-get total-staked) (get amount stake-info)))
+      true
+    )
+    false
+  )
+)
+
+;; Reward distribution functions
+(define-private (distribute-rewards-to-user (user principal) (reward-amount uint))
+  (let (
+    (fee-calculation (apply-protocol-fee reward-amount))
+    (net-reward (get net-reward fee-calculation))
+    (fee-amount (get fee fee-calculation))
+    (current-rewards (default-to { pending-rewards: u0, total-claimed: u0 }
+                                 (map-get? user-rewards { user: user })))
+  )
+    (begin
+      ;; Update user rewards
+      (map-set user-rewards { user: user }
+        {
+          pending-rewards: u0,
+          total-claimed: (+ (get total-claimed current-rewards) net-reward)
+        }
+      )
+      ;; Update global stats
+      (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) net-reward))
+      (var-set reward-pool-balance (- (var-get reward-pool-balance) reward-amount))
+      ;; Return net reward amount
+      net-reward
+    )
+  )
+)
+
+(define-private (update-last-claim-block (user principal))
+  (match (map-get? user-stakes { user: user })
+    stake-info
+    (map-set user-stakes { user: user }
+      (merge stake-info { last-claim-block: block-height })
+    )
+    false
+  )
+)
+
+;; Helper functions
+(define-private (is-staking-period-complete (user principal))
+  (match (map-get? user-stakes { user: user })
+    stake-info
+    (>= block-height (get end-block stake-info))
+    false
+  )
+)
+
+(define-private (get-blocks-remaining (user principal))
+  (match (map-get? user-stakes { user: user })
+    stake-info
+    (if (> (get end-block stake-info) block-height)
+      (some (- (get end-block stake-info) block-height))
+      (some u0)
+    )
+    none
+  )
+)
+
+(define-private (has-sufficient-reward-pool (required-amount uint))
+  (>= (var-get reward-pool-balance) required-amount)
+)
 
 ;; public functions
 ;;
